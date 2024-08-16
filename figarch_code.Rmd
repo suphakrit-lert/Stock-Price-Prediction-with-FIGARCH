@@ -1,0 +1,341 @@
+---
+title: "Stock Price Prediction with FIGARCH"
+output: pdf_document
+date: "2024-04-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=FALSE, echo = TRUE)
+```
+
+Data Description: Stocks, Daily adjusted closing prices of Apple, Adobe, Amazon, Facebook, Google, and the S&P 500 from the beginning of 2017 into 2019.
+
+
+``` {r}
+library(quantmod)
+library(ggplot2)
+library(forecast)
+library(tseries)
+library(rugarch)
+library(prophet)
+library(tsfknn)
+library(caTools)
+```
+
+``` {r}
+# Set constants
+SEED <- 5550
+load("selected.Rdata")
+stocks <- Stocks
+head(stocks)
+```
+
+``` {r}
+# Split data to train and test
+set.seed(SEED)
+
+# Create training and testing datasets
+train_stocks <- window(stocks, start=c(2017, 1), end=c(2019, 36))
+test_stocks <- window(stocks, start=c(2019, 37))
+
+print(sprintf("Length of train data: %s", length(train_stocks)))
+print(sprintf("Length of test data: %s", length(test_stocks)))
+```
+
+
+# Part 2: Problem Statement
+
+``` {r}
+# Plot with S&P 500 Indicator
+ylim <- max(stocks)
+
+plot.ts(
+    stocks[, "AAPL"],
+    col="red",
+    xlab="Time",
+    ylab="Stock Price",
+    ylim=c(0,ylim)
+)
+
+lines(stocks[, "ADBE"], col="green")
+lines(stocks[, "AMZN"], col="blue")
+lines(stocks[, "FB"], col="orange")
+lines(stocks[, "GOOG"], col="cyan")
+lines(stocks[, "^GSPC"], col="purple")
+
+legend(
+    "topleft",
+    legend=c("AAPL", "ADBE", "AMZN", "FB", "GOOG", "S&P 500"),
+    col=c("red", "green", "blue", "orange", "cyan", "purple"),
+    lty=1,
+    cex=0.6
+)
+```
+
+``` {r}
+# Plot without S&P 500 Indicator
+stocks <- ts(stocks)
+plot.ts(
+    stocks[, "AAPL"],
+    col="red",
+    xlab="Time",
+    ylab="Stock Price",
+    ylim=c(0,max(Stocks[,c(-6)]))
+)
+
+lines(stocks[, "ADBE"], col="green")
+lines(stocks[, "AMZN"], col="blue")
+lines(stocks[, "FB"], col="orange")
+lines(stocks[, "GOOG"], col="cyan")
+lines(stocks[, "^GSPC"], col="purple")
+
+legend(
+    "topleft",
+    legend=c("AAPL", "ADBE", "AMZN", "FB", "GOOG"),
+    col=c("red", "green", "blue", "orange", "cyan"),
+    lty=1,
+    cex=1
+)
+#
+```
+
+
+``` {r}
+# Test for stationarity
+for (colname in colnames(train_stocks)) {
+  print(adf.test(train_stocks[, colname]))
+}
+```
+
+``` {r}
+# Find the log returns
+train_log_returns <- diff(log(train_stocks), lag=1)
+train_log_returns <- na.omit(train_log_returns)
+
+# Log returns plot
+plot.ts(train_log_returns, type='l', main= 'Log Returns Plot')
+```
+
+``` {r}
+# Find the log returns
+test_log_returns <- diff(log(test_stocks), lag=1)
+test_log_returns <- na.omit(test_log_returns)
+
+# Log returns plot
+plot.ts(test_log_returns, type='l', main= 'Log Returns Plot')
+```
+
+
+``` {r}
+# Test for stationarity for log returns 
+for (colname in colnames(train_log_returns)) {
+  print(adf.test(train_log_returns[, colname]))
+}
+```
+
+``` {r}
+par(mfrow=c(2,3))
+acf(train_log_returns[, "AAPL"], xlab = "lags", ylab = "ACF", main="ACF of AAPL Time Series")
+acf(train_log_returns[, "ADBE"], xlab = "lags", ylab = "ACF", main="ACF of ADBE Time Series")
+acf(train_log_returns[, "AMZN"], xlab = "lags", ylab = "ACF", main="ACF of AMZN Time Series")
+
+pacf(train_log_returns[, "AAPL"], xlab = "lags", ylab = "PACF", main="PACF of AAPL Time Series")
+pacf(train_log_returns[, "ADBE"], xlab = "lags", ylab = "PACF", main="PACF of ADBE Time Series")
+pacf(train_log_returns[, "AMZN"], xlab = "lags", ylab = "PACF", main="PACF of AMZN Time Series")
+#
+```
+
+``` {r}
+par(mfrow=c(2,3))
+acf(train_log_returns[, "FB"], xlab = "lags", ylab = "ACF", main="ACF of FB Time Series")
+acf(train_log_returns[, "GOOG"], xlab = "lags", ylab = "ACF", main="ACF of GOOG Time Series")
+acf(train_log_returns[, "^GSPC"], xlab = "lags", ylab = "ACF", main="ACF of S&P500 Time Series")
+
+pacf(train_log_returns[, "FB"], xlab = "lags", ylab = "PACF", main="PACF of FB Time Series")
+pacf(train_log_returns[, "GOOG"], xlab = "lags", ylab = "PACF", main="PACF of GOOG Time Series")
+pacf(train_log_returns[, "^GSPC"], xlab = "lags", ylab = "PACF", main="PACF of S&P500 Time Series")
+```
+
+``` {r}
+# Get ARMA parameters from ARFIMA
+auto_arfima_modelling <- function (x) autoarfima(
+  x, ar.max = 8, ma.max = 8, criterion = "AIC", method = "full"
+)
+arfima_models <- lapply(train_log_returns, auto_arfima_modelling)
+```
+
+## Use the FIGARCH model
+
+``` {r}
+# AAPL
+spec_AAPL <- ugarchspec(
+  variance.model = list(
+    model = "fGARCH",
+    submodel = "GARCH",
+    garchOrder = c(1, 1)  
+  ),
+  mean.model = list(
+    armaOrder = c(2, 2),
+    include.mean = TRUE
+  ),
+  distribution.model = "norm"  
+)
+
+# Fit the model
+fgarch_fit_AAPL <- ugarchfit(spec = spec_AAPL, data = train_log_returns[, "AAPL"])
+
+# Forecast the next 30 days
+forecasts_returns_AAPL <- ugarchforecast(fgarch_fit_AAPL, n.ahead = 30)
+
+forecasts_AAPL <- as.numeric(tail(train_stocks[, "AAPL"], n=1)) * exp(cumsum(forecasts_returns_AAPL@forecast$seriesFor))
+
+plot(as.vector(test_stocks[, "AAPL"]))
+lines(ts(forecasts_AAPL), col="red")
+```
+
+``` {r}
+# ADBE
+spec_ADBE <- ugarchspec(
+  variance.model = list(
+    model = "fGARCH",
+    submodel = "GARCH",
+    garchOrder = c(1, 1)  
+  ),
+  mean.model = list(
+    armaOrder = c(5, 1),
+    include.mean = TRUE
+  ),
+  distribution.model = "norm"  
+)
+
+# Fit the model
+fgarch_fit_ADBE <- ugarchfit(spec = spec_ADBE, data = train_log_returns[, "ADBE"])
+
+# Forecast the next 30 days
+forecasts_returns_ADBE <- ugarchforecast(fgarch_fit_ADBE, n.ahead = 30)
+
+forecasts_ADBE <- as.numeric(tail(train_stocks[, "ADBE"], n=1)) * exp(cumsum(forecasts_returns_ADBE@forecast$seriesFor))
+
+plot(as.vector(test_stocks[, "ADBE"]))
+lines(ts(forecasts_ADBE), col="red")
+```
+
+``` {r}
+# AMZN
+spec_AMZN <- ugarchspec(
+  variance.model = list(
+    model = "fGARCH",
+    submodel = "GARCH",
+    garchOrder = c(1, 1)  
+  ),
+  mean.model = list(
+    armaOrder = c(4, 2),
+    include.mean = TRUE
+  ),
+  distribution.model = "norm"  
+)
+
+# Fit the model
+fgarch_fit_AMZN <- ugarchfit(spec = spec_AMZN, data = train_log_returns[, "AMZN"])
+
+# Forecast the next 30 days
+forecasts_returns_AMZN <- ugarchforecast(fgarch_fit_AMZN, n.ahead = 30)
+
+forecasts_AMZN <- as.numeric(tail(train_stocks[, "AMZN"], n=1)) * exp(cumsum(forecasts_returns_AMZN@forecast$seriesFor))
+
+plot(as.vector(test_stocks[, "AMZN"]))
+lines(ts(forecasts_AMZN), col="red")
+```
+
+``` {r}
+# FB
+spec_FB <- ugarchspec(
+  variance.model = list(
+    model = "fGARCH",
+    submodel = "GARCH",
+    garchOrder = c(1, 1)  
+  ),
+  mean.model = list(
+    armaOrder = c(2, 2),
+    include.mean = TRUE
+  ),
+  distribution.model = "norm"  
+)
+
+# Fit the model
+fgarch_fit_FB <- ugarchfit(spec = spec_FB, data = train_log_returns[, "FB"])
+
+# Forecast the next 30 days
+forecasts_returns_FB <- ugarchforecast(fgarch_fit_FB, n.ahead = 30)
+
+forecasts_FB <- as.numeric(tail(train_stocks[, "FB"], n=1)) * exp(cumsum(forecasts_returns_FB@forecast$seriesFor))
+
+plot(as.vector(test_stocks[, "FB"]))
+lines(ts(forecasts_FB), col="red")
+```
+
+``` {r}
+# GOOG
+spec_GOOG <- ugarchspec(
+  variance.model = list(
+    model = "fGARCH",
+    submodel = "GARCH",
+    garchOrder = c(1, 1)  
+  ),
+  mean.model = list(
+    armaOrder = c(5, 2),
+    include.mean = TRUE
+  ),
+  distribution.model = "norm"  
+)
+
+# Fit the model
+fgarch_fit_GOOG <- ugarchfit(spec = spec_GOOG, data = train_log_returns[, "GOOG"])
+
+# Forecast the next 30 days
+forecasts_returns_GOOG <- ugarchforecast(fgarch_fit_GOOG, n.ahead = 30)
+
+forecasts_GOOG <- as.numeric(tail(train_stocks[, "GOOG"], n=1)) * exp(cumsum(forecasts_returns_GOOG@forecast$seriesFor))
+
+plot(as.vector(test_stocks[, "GOOG"]))
+lines(ts(forecasts_GOOG), col="red")
+```
+
+``` {r}
+par(mfrow=c(2, 3))
+plot(as.vector(test_stocks[, "AAPL"]), xlab = "Index", ylab = "Price", main="AAPL Actual Price and Forecast")
+lines(ts(forecasts_AAPL), col="red")
+
+plot(as.vector(test_stocks[, "ADBE"]), xlab = "Index", ylab = "Price", main="ADBE Actual Price and Forecast")
+lines(ts(forecasts_ADBE), col="red")
+
+plot(as.vector(test_stocks[, "AMZN"]), xlab = "Index", ylab = "Price", main="AMZN Actual Price and Forecast")
+lines(ts(forecasts_AMZN), col="red")
+
+plot(as.vector(test_stocks[, "FB"]), xlab = "Index", ylab = "Price", main="FB Actual Price and Forecast")
+lines(ts(forecasts_FB), col="red")
+
+plot(as.vector(test_stocks[, "GOOG"]), xlab = "Index", ylab = "Price", main="GOOG Actual Price and Forecast")
+lines(ts(forecasts_GOOG), col="red")
+
+```
+
+``` {r}
+par(mfrow=c(2, 3))
+plot(as.vector(test_log_returns[, "AAPL"]), type="l", xlab = "Index", ylab = "Log Returns", main="AAPL Log Returns and Forecast")
+lines(ts(forecasts_returns_AAPL@forecast$seriesFor), col="red")
+
+plot(as.vector(test_log_returns[, "ADBE"]), type="l", xlab = "Index", ylab = "Log Returns", main="ADBE Log Returns and Forecast")
+lines(ts(forecasts_returns_ADBE@forecast$seriesFor), col="red")
+
+plot(as.vector(test_log_returns[, "AMZN"]), type="l", xlab = "Index", ylab = "Log Returns", main="AMZN Log Returns and Forecast")
+lines(ts(forecasts_returns_AMZN@forecast$seriesFor), col="red")
+
+plot(as.vector(test_log_returns[, "FB"]), type="l", xlab = "Index", ylab = "Log Returns", main="FB Log Returns and Forecast")
+lines(ts(forecasts_returns_FB@forecast$seriesFor), col="red")
+
+plot(as.vector(test_log_returns[, "GOOG"]), type="l", xlab = "Index", ylab = "Log Returns", main="GOOG Log Returns and Forecast")
+lines(ts(forecasts_returns_GOOG@forecast$seriesFor), col="red")
+```
+
+
